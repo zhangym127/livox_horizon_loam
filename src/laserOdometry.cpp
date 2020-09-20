@@ -114,18 +114,34 @@ std::queue<sensor_msgs::PointCloud2ConstPtr> surfLessFlatBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> fullPointsBuf;
 std::mutex mBuf;
 
+/**
+ * 对点云进行帧内校正，向第一个点看齐
+ * @param pi 输入点
+ * @param po 输出点
+ * @return 无
+ */
 // undistort lidar point
 void TransformToStart(PointType const *const pi, PointType *const po) {
   // interpolation ratio
   double s;
+  
+  /* intensity的整数部分是行号，小数部分是时间戳 */
   if (DISTORTION)
     s = (pi->intensity - int(pi->intensity))*10;
   else
     s = 1.0;
   // s = 1;
+  
+  /* 在表示旋转的四元数Identity(0,0,0,0)和q_last_curr之间进行插值，比例系数是s，s必须在0到1之间。
+   * q_last_curr应该是当前点云帧中最后一个点的旋转四元数，而表示第一个点的旋转四元数是Identity。
+   * 通过插值，找到帧内每个点对应的旋转向量q_point_last。 */
   Eigen::Quaterniond q_point_last =
       Eigen::Quaterniond::Identity().slerp(s, q_last_curr);
+	  
+  /* t_last_curr应该是当前点云帧中最后一个点的平移向量，乘以当前点的时间比例系数 */
   Eigen::Vector3d t_point_last = s * t_last_curr;
+  
+  /* 对当前点进行旋转和平移，获得帧内校正后的点 */
   Eigen::Vector3d point(pi->x, pi->y, pi->z);
   Eigen::Vector3d un_point = q_point_last * point + t_point_last;
 
@@ -197,6 +213,7 @@ int main(int argc, char **argv) {
 
   printf("Mapping %d Hz \n", 10 / skipFrameNum);
 
+  /* 订阅Sharp、LessSharp、Flat、LessFlat四种点云，并调用回调函数将点云添加到对应的缓冲中 */
   ros::Subscriber subCornerPointsSharp = nh.subscribe<sensor_msgs::PointCloud2>(
       "/laser_cloud_sharp", 100, laserCloudSharpHandler);
 
@@ -214,6 +231,7 @@ int main(int argc, char **argv) {
   ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>(
       "/velodyne_cloud_2", 100, laserCloudFullResHandler);
 
+  /* 创建publisher对象，准备进行发布 */
   ros::Publisher pubLaserCloudCornerLast =
       nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_corner_last", 100);
 
@@ -237,16 +255,19 @@ int main(int argc, char **argv) {
   while (ros::ok()) {
     ros::spinOnce();
 
+
     if (!cornerSharpBuf.empty() && !cornerLessSharpBuf.empty() &&
         !surfFlatBuf.empty() && !surfLessFlatBuf.empty() &&
         !fullPointsBuf.empty()) {
+	  /* 获得Sharp等四种点云的起始时间戳 */
       timeCornerPointsSharp = cornerSharpBuf.front()->header.stamp.toSec();
       timeCornerPointsLessSharp =
           cornerLessSharpBuf.front()->header.stamp.toSec();
       timeSurfPointsFlat = surfFlatBuf.front()->header.stamp.toSec();
       timeSurfPointsLessFlat = surfLessFlatBuf.front()->header.stamp.toSec();
       timeLaserCloudFullRes = fullPointsBuf.front()->header.stamp.toSec();
-
+	
+	  /* 如果四种点云的时间戳与整个点云的起始时间戳不一致，则break */
       if (timeCornerPointsSharp != timeLaserCloudFullRes ||
           timeCornerPointsLessSharp != timeLaserCloudFullRes ||
           timeSurfPointsFlat != timeLaserCloudFullRes ||
@@ -255,6 +276,7 @@ int main(int argc, char **argv) {
         ROS_BREAK();
       }
 
+	  /* 从订阅的ROS消息中取出对应的四组点云，以及完整点云 */
       mBuf.lock();
       cornerPointsSharp->clear();
       pcl::fromROSMsg(*cornerSharpBuf.front(), *cornerPointsSharp);
@@ -291,6 +313,7 @@ int main(int argc, char **argv) {
           corner_correspondence = 0;
           plane_correspondence = 0;
 
+		  /* 下面使用Ceres库对前后两帧点云进行非线性优化，获得里程计 */
           // ceres::LossFunction *loss_function = NULL;
           ceres::LossFunction *loss_function = new ceres::HuberLoss(0.1);
           ceres::LocalParameterization *q_parameterization =
@@ -306,11 +329,16 @@ int main(int argc, char **argv) {
           std::vector<float> pointSearchSqDis;
 
           TicToc t_data;
+		  /* 遍历曲度为Sharp的点云，与前一帧的LessSharp点云匹配 */
           for (int i = 0; i < cornerPointsSharpNum; ++i) {
+			/* 对当前点进行帧内校正，由于是慢速场景，实际上没有做 */
             TransformToStart(&(cornerPointsSharp->points[i]), &pointSel);
+			/* 在上一帧LessSharp点云中寻找与当前点最近的5个点，pointSearchInd是找到的5个最近点，
+			 * pointSearchSqDis是五个最近点的距离 */
             kdtreeCornerLast->nearestKSearch(pointSel, 5, pointSearchInd,
                                              pointSearchSqDis);
 
+			/* 如果5个最近点的距离都小于给定阈值，将这5个点加入nearCorners，并计算这五个点的质心center，即均值 */
             if (pointSearchSqDis[4] < DISTANCE_SQ_THRESHOLD) {
               std::vector<Eigen::Vector3d> nearCorners;
               Eigen::Vector3d center(0, 0, 0);
@@ -324,6 +352,7 @@ int main(int argc, char **argv) {
               }
               center = center / 5.0;
 
+			  /* 求五个点的协方差矩阵 */
               Eigen::Matrix3d covMat = Eigen::Matrix3d::Zero();
               for (int j = 0; j < 5; j++) {
                 Eigen::Matrix<double, 3, 1> tmpZeroMean =
@@ -331,14 +360,21 @@ int main(int argc, char **argv) {
                 covMat = covMat + tmpZeroMean * tmpZeroMean.transpose();
               }
 
+			  /* 计算自伴随矩阵covMat的特征值和特征向量 */
               Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(covMat);
 
+			  /* 确认这五个点是成一条线分布，也就某个物体边缘的一部分 */
               // if is indeed line feature
+			  
+			  /* Eigen计算出来的特征值以增序排列，col(2)就是取三个特征值中最大的一个 */
               // note Eigen library sort eigenvalues in increasing order
               Eigen::Vector3d unit_direction = saes.eigenvectors().col(2);
               // Eigen::Vector3d curr_point(pointOri.x, pointOri.y, pointOri.z);
+			  
+			  /* 确认最大的特征值远远大于（3倍以上）次大的特征值，也就是五个点基本上成一条线分布 */
               if (saes.eigenvalues()[2] > 3 * saes.eigenvalues()[1]) {
                 Eigen::Vector3d point_on_line = center;
+				/* 沿最大特征向量方向，以质心为中心，在质心两侧构造a、b两个点，a、b两个点距离质心0.1米 */
                 Eigen::Vector3d last_point_a, last_point_b;
                 last_point_a = 0.1 * unit_direction + point_on_line;
                 last_point_b = -0.1 * unit_direction + point_on_line;
@@ -353,6 +389,7 @@ int main(int argc, char **argv) {
                 else
                   s = 1.0;
 
+				/* 将当前点p和a、b两个点加入优化序列，最优的结果是a、p、b三点一线，p在正中间 */
                 // printf(" Edge s------ %f  \n", s);
                 ceres::CostFunction *cost_function = LidarEdgeFactor::Create(
                     curr_point, last_point_a, last_point_b, s);
@@ -363,15 +400,23 @@ int main(int argc, char **argv) {
             }
           }
 
+		  /* 遍历曲度为Flat的点云，与前一帧的LessFlat点云匹配 */
           // find correspondence for plane features
           for (int i = 0; i < surfPointsFlatNum; ++i) {
+			/* 对该点进行帧内校正，校正到帧内起点的状态 */
             TransformToStart(&(surfPointsFlat->points[i]), &pointSel);
+			
+			/* 在上一帧LessFlat点云中寻找与当前点最近的5个点，pointSearchInd是找到的5个最近点，
+			 * pointSearchSqDis是五个最近点的距离 */
             kdtreeSurfLast->nearestKSearch(pointSel, 5, pointSearchInd,
                                            pointSearchSqDis);
 
+			/* 定义矩阵A[5,3]和B[5,1]，其中B是全-1列向量 */
             Eigen::Matrix<double, 5, 3> matA0;
             Eigen::Matrix<double, 5, 1> matB0 =
                 -1 * Eigen::Matrix<double, 5, 1>::Ones();
+			
+			/* 如果5个最近点的距离都小于给定阈值，用五个点的坐标初始化矩阵A */
             if (pointSearchSqDis[4] < DISTANCE_SQ_THRESHOLD) {
               for (int j = 0; j < 5; j++) {
                 matA0(j, 0) = laserCloudSurfLast->points[pointSearchInd[j]].x;
@@ -380,14 +425,25 @@ int main(int argc, char **argv) {
                 // printf(" pts %f %f %f ", matA0(j, 0), matA0(j, 1), matA0(j,
                 // 2));
               }
+			  /* 求解三元一次方程组Ax=b，进行平面的法向量估计
+			   * 三元一次方程Ax+By+Cz+D=0对应于空间平面，向量n=(A,B,C)是其法向量，
+			   * 这里已知五个点在同一平面，且设定D为1，则一定可以找到唯一的一组法
+			   * 向量n=(A,B,C)与该平面对应，调用A.colPivHouseholderQr().solve(b)
+			   * 求解三元一次方程组，获得法向量n=(A,B,C)。*/
               // find the norm of plane
               Eigen::Vector3d norm = matA0.colPivHouseholderQr().solve(matB0);
-              double negative_OA_dot_norm = 1 / norm.norm();
-              norm.normalize();
+			  
+			  /* 下面用法向量检查这五个点是否构成一个严格的平面
+               * 在平面上的点p(x,y,z)一定满足方程Ax+By+Cz+1=0,如果法向量(A,B,C)的范数
+               * 是n，则方程的两边同时除以n，等式仍然成立：(A/n)x+(B/n)y+(C/n)z+1/n=0。
+               * 不满足这个等式的点不在该平面上。*/
+              double negative_OA_dot_norm = 1 / norm.norm(); //求1/n
+              norm.normalize(); //求(A/n,B/n,C/n)
 
               // Here n(pa, pb, pc) is unit norm of plane
               bool planeValid = true;
               for (int j = 0; j < 5; j++) {
+				/* 计算等式(A/n)x+(B/n)y+(C/n)z+1/n的值，并检查是否接近于0 */
                 // if OX * n > 0.2, then plane is not fit well
                 if (fabs(norm(0) *
                              laserCloudSurfLast->points[pointSearchInd[j]].x +
@@ -396,11 +452,13 @@ int main(int argc, char **argv) {
                          norm(2) *
                              laserCloudSurfLast->points[pointSearchInd[j]].z +
                          negative_OA_dot_norm) > 0.02) {
+				  /* 该点距离平面太远 */
                   planeValid = false;
                   break;
                 }
               }
 
+			  /* 仅当五个点都在一个平面上时，抽取第1、3、5号点与当前点进行空间变换的非线性优化 */
               if (planeValid) {
                 Eigen::Vector3d curr_point(surfPointsFlat->points[i].x,
                                            surfPointsFlat->points[i].y,
@@ -443,6 +501,7 @@ int main(int argc, char **argv) {
                 "*************************************************\n");
           }
 
+		  /* 开始优化 */
           TicToc t_solver;
           ceres::Solver::Options options;
           options.linear_solver_type = ceres::DENSE_QR;
@@ -454,6 +513,7 @@ int main(int argc, char **argv) {
         }
         printf("optimization twice time %f \n", t_opt.toc());
 
+		/* 优化后的结果保存在q_last_curr和t_last_curr中 */
         t_w_curr = t_w_curr + q_w_curr * t_last_curr;
         q_w_curr = q_w_curr * q_last_curr;
         std::cout<<"t_w_curr: "<<t_w_curr.transpose()<<std::endl;
@@ -461,6 +521,7 @@ int main(int argc, char **argv) {
 
       TicToc t_pub;
 
+	  /* 发布里程计，即当前最新的位姿，包括旋转和平移 */
       // publish odometry
       nav_msgs::Odometry laserOdometry;
       laserOdometry.header.frame_id = "/camera_init";
@@ -475,6 +536,7 @@ int main(int argc, char **argv) {
       laserOdometry.pose.pose.position.z = t_w_curr.z();
       pubLaserOdometry.publish(laserOdometry);
 
+	  /* 发布位姿的轨迹 */
       geometry_msgs::PoseStamped laserPose;
       laserPose.header = laserOdometry.header;
       laserPose.pose = laserOdometry.pose.pose;
@@ -483,6 +545,7 @@ int main(int argc, char **argv) {
       laserPath.header.frame_id = "/camera_init";
       pubLaserPath.publish(laserPath);
 
+	  /* 将Sharp、Flat和完整点云校正为向最后一个点看齐 */
       // transform corner features and plane features to the scan end point
       if (DISTORTION) {
         int cornerPointsLessSharpNum = cornerPointsLessSharp->points.size();
@@ -524,6 +587,7 @@ int main(int argc, char **argv) {
       if (frameCount % skipFrameNum == 0) {
         frameCount = 0;
 
+		/* 发布Sharp类型的点云，尽管Sharp点云没有任何变化，再次发布出去 */
         sensor_msgs::PointCloud2 laserCloudCornerLast2;
         pcl::toROSMsg(*cornerPointsSharp, laserCloudCornerLast2);
         laserCloudCornerLast2.header.stamp =
@@ -531,6 +595,7 @@ int main(int argc, char **argv) {
         laserCloudCornerLast2.header.frame_id = "/aft_mapped";
         pubLaserCloudCornerLast.publish(laserCloudCornerLast2);
 
+		/* 发布Flat类型的点云，尽管Flat点云也没有任何变化，再次发布出去 */
         sensor_msgs::PointCloud2 laserCloudSurfLast2;
         pcl::toROSMsg(*surfPointsFlat, laserCloudSurfLast2);
         laserCloudSurfLast2.header.stamp =
@@ -538,6 +603,7 @@ int main(int argc, char **argv) {
         laserCloudSurfLast2.header.frame_id = "/aft_mapped";
         pubLaserCloudSurfLast.publish(laserCloudSurfLast2);
 
+		/* 发布完整点云，尽管完整点云也没有任何变化，再次发布出去 */
         sensor_msgs::PointCloud2 laserCloudFullRes3;
         pcl::toROSMsg(*laserCloudFullRes, laserCloudFullRes3);
         laserCloudFullRes3.header.stamp =

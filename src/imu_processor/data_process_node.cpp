@@ -30,6 +30,11 @@ void SigHandle(int sig) {
   sig_buffer.notify_all();
 }
 
+/**
+ * 将当前点云帧添加到缓冲
+ * @param msg: 当前点云帧
+ * @return 无
+ */
 void pointcloud_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg) {
   const double timestamp = msg->header.stamp.toSec();
   // ROS_DEBUG("get point cloud at time: %.6f", timestamp);
@@ -48,6 +53,11 @@ void pointcloud_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg) {
   sig_buffer.notify_all();
 }
 
+/**
+ * 将当前IMU数据帧添加到缓冲
+ * @param msg_in: 当前IMU帧
+ * @return 无
+ */
 void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in) {
   sensor_msgs::Imu::Ptr msg(new sensor_msgs::Imu(*msg_in));
 
@@ -69,12 +79,19 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in) {
   sig_buffer.notify_all();
 }
 
+/**
+ * 对点云和IMU数据进行同步。
+ * @param measgroup: 存放同步数据的缓冲
+ * @return 无
+ */
 bool SyncMeasure(MeasureGroup &measgroup) {
+	
   if (lidar_buffer.empty() || imu_buffer.empty()) {
     /// Note: this will happen
     return false;
   }
 
+  /* 所有的IMU数据时间戳都比点云更大，点云数据已经过时，直接清空点云数据 */
   if (imu_buffer.front()->header.stamp.toSec() >
       lidar_buffer.back()->header.stamp.toSec()) {
     lidar_buffer.clear();
@@ -82,16 +99,22 @@ bool SyncMeasure(MeasureGroup &measgroup) {
     return false;
   }
 
+  /* 所有的IMU数据时间戳都比点云更小，IMU数据有可能不完整，直接返回 */
   if (imu_buffer.back()->header.stamp.toSec() <
       lidar_buffer.front()->header.stamp.toSec()) {
     return false;
   }
 
+  /* 以点云的时间戳为准，小于该时间戳的所有IMU数据都转移到同步缓冲 */
+  
+  /* 取最旧的一帧点云放入同步缓冲 */
   /// Add lidar data, and pop from buffer
   measgroup.lidar = lidar_buffer.front();
   lidar_buffer.pop_front();
   double lidar_time = measgroup.lidar->header.stamp.toSec();
 
+  /* 将时间戳小于该点云的所有IMU数据转移到同步缓冲，
+   * 这就确保同步缓冲中的所有IMU数据时间戳都小于点云 */
   /// Add imu data, and pop from buffer
   measgroup.imu.clear();
   int imu_cnt = 0;
@@ -110,6 +133,11 @@ bool SyncMeasure(MeasureGroup &measgroup) {
   return true;
 }
 
+/**
+ * 对缓冲中的点云和IMU数据进行同步，匹配后进行处理。
+ * @param measgroup: 存放同步数据的缓冲
+ * @return 无
+ */
 void ProcessLoop(std::shared_ptr<ImuProcess> p_imu) {
   ROS_INFO("Start ProcessLoop");
 
@@ -138,11 +166,18 @@ void ProcessLoop(std::shared_ptr<ImuProcess> p_imu) {
   }
 }
 
+/**
+ * 传感器数据处理节点。
+ * @param argc: 
+ * @param argv: 
+ * @return 无
+ */
 int main(int argc, char **argv) {
   ros::init(argc, argv, "data_process");
   ros::NodeHandle nh;
   signal(SIGINT, SigHandle);
 
+  /* 订阅点云和IMU数据，并注册对应的回调函数 */
   ros::Subscriber sub_pcl = nh.subscribe(topic_pcl, 100, pointcloud_cbk);
   ros::Subscriber sub_imu = nh.subscribe(topic_imu, 1000, imu_cbk);
 
