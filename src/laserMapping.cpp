@@ -249,7 +249,7 @@ void laserCloudFullResHandler(
 }
 
 /**
- * 接收并处理里程计数据
+ * @brief 接收并处理里程计数据
  * @param laserOdometry 里程计数据
  * @return 无
  */
